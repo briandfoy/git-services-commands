@@ -1,0 +1,31 @@
+#!
+
+my $ghojo = _ghojo();
+
+my $repo = $ARGV[0] // do {
+	state $r1 = require File::Basename;
+	state $r2 = require Cwd;
+	File::Basename::basename(Cwd::getcwd());
+	};
+
+my $rc = $ghojo->create_repo( { name => $repo, description => $description } );
+
+if( $rc->is_success ) {
+	say "Created repo <$name>";
+	}
+else {
+	die "Counld not create repo <$name>: " . dumper($rc);
+	}
+
+sub _ghojo () {
+	state $rc = require Ghojo;
+	my $token = $ENV{GITHUB_TOKEN}
+	my $ghojo = Ghojo->new( { token => $token } );
+
+	if( $ghojo->is_error ) {
+		say $ghojo->long_summary;
+		exit(10);
+		}
+
+	$ghojo;
+	}
