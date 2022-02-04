@@ -1,0 +1,227 @@
+#!/usr/bin/env perl
+use v5.10;
+use strict;
+
+use constant EX_USAGE => 2;
+
+my $git = $ENV{_};
+
+my %Operations = (
+	'create' => 'post',
+	'delete' => 'delete',
+	);
+
+my %args = (
+	'dry-run' => 0,
+	'no-init' => 0,
+	'project' => 'PROJ',
+	'remote'  => 'bitbucket',
+	'verbose' => 0,
+	map { $_, undef } keys %Operations
+	);
+
+chomp( $args{user} = `$git config bitbucket.user` );
+$args{repo} = do {
+	state $r1 = require File::Basename;
+	state $r2 = require Cwd;
+	File::Basename::basename(Cwd::getcwd());
+	};
+
+use Getopt::Long;
+GetOptions(
+	'dry-run'   => \$args{'dry-run'},
+	'no-init'   => \$args{'no-init'},
+	'project'   => \$args{'project'},
+	'remote=s'  => \$args{'remote'},
+	'repo=s'    => \$args{'repo'},
+	'user=s'    => \$args{'user'},
+	'verbose'   => \$args{'verbose'},
+	map { $_, \$args{$_} } keys %Operations
+	);
+say Dumper( \%args ); use Data::Dumper;
+
+unless( $args{user} ) {
+	warn "No user! Set bitbucket.user or use --user\n";
+	exit( EX_USAGE );
+	}
+
+my @operations = map { "--$_" } grep { defined $args{$_} } sort keys %Operations;
+if( 1 < @operations ) {
+	warn "Can't do two operations at the same time: @operations\n";
+	exit( EX_USAGE );
+	}
+
+my $operation = ($operations[0] // 'create') =~ s/\A--//r;
+say "Operation is <$operation>";
+
+my $token = $ENV{BITBUCKET_APP_PASSWORD}
+	// do {
+		warn "Set BITBUCKET_APP_PASSWORD to your BitBucket app password\nhttps://support.atlassian.com/bitbucket-cloud/docs/app-passwords/\n";
+		exit( EX_USAGE );
+		};
+
+if( $args{'dry-run'} ) {
+	say <<~"HERE";
+		Operation: $operation
+		User:      $args{user}
+		Project:   $args{project}
+		Repo:      $args{repo}
+		Verbose:   $args{verbose}
+		HERE
+
+	exit;
+	}
+
+require Mojo::UserAgent;
+require Mojo::Util;
+my $ua = Mojo::UserAgent->new;
+$ua->on( start => sub {
+	my( $ua, $tx ) = @_;
+	$tx->req->headers->authorization( "Basic " . Mojo::Util::b64_encode( join ':', $args{user}, $token ) );
+	} );
+
+if( ! -e '.git' and ! $args{'no-init'} ) {
+	system $git, 'init' or die "Could not init git repo";
+	exit(8);
+	}
+
+if( $operation eq 'create' ) {
+	# https://github.com/briandfoy/git-default-branch
+	chomp( my $default_branch = `$git default-branch` );
+	$default_branch = length $default_branch ? $default_branch : 'master';
+	say "Default branch is <$default_branch>" if $args{verbose};
+
+	my $url = sprintf 'https://api.bitbucket.org/2.0/repositories/%s/%s', @args{qw(user repo)};
+
+	my $tx = $ua->post(
+		$url,
+		json => { project => { key => $args{project} } },
+		);
+	my $success = eval { $tx->result->is_success };
+	unless( defined $success ) {
+		warn "Error talking to BitBucket";
+		say $tx->res->to_string if $args{verbose};
+		exit(4);
+		}
+
+	if( $tx->res->code == 400 ) {
+		warn "ERROR: " . (eval { $tx->res->json->{error}{message} } // $tx->res->body) . "\n";
+		say $tx->res->to_string if $args{verbose};
+		exit(16);
+		}
+	say "Created Bitbucket repo <$args{user}/$args{repo}>" if $args{verbose};
+
+	my( $clone ) =
+		map { $_->{href} }
+		grep { $_->{name} eq 'ssh' }
+		$tx->result->json->{links}{clone}->@*;
+	say "Clone URL is <$clone>" if $args{verbose};
+
+	system $git, 'remote', 'add', $args{remote}, $clone;
+	system $git, 'push', $args{remote}, $default_branch;
+	}
+elsif( $operation eq 'delete' ) {
+	my $tx = $ua->delete(
+		sprintf 'https://api.bitbucket.org/2.0/repositories/%s/%s', @args{qw(user repo)}
+		);
+	my $code = $tx->res->code;
+	if( $code == 204 ) {
+		say "deleted $args{user}/$args{repo}";
+		system $git, 'remote', 'rm', $args{remote};
+		}
+	elsif( $code == 404 ) {
+		warn "$args{user}/$args{repo} already did not exist\n";
+		}
+	elsif( $code == 403 ) {
+		warn $tx->res->json->{error}{message};
+		}
+	else {
+		warn "Could not delete $args{user}/$args{repo}";
+		say $tx->req->to_string if $args{verbose};
+		say $tx->res->to_string if $args{verbose};
+		exit(16);
+		}
+	}
+
+__DATA__
+% GIT-BITBUCKET(1) | Git Manual
+
+NAME
+====
+
+**git-bitbucket** — create or delete Bitbucket project based on the current directory
+
+SYNOPSIS
+========
+
+| **git config --global --add bitbucket.user myusername
+| **export BITBUCKET_APP_PASSWORD=...
+| **git bitbucket [--create | --delete] [--repo=<repo>] [--user=<user>]**
+|     **[--remote=<remote>] [--verbose] [--dry-run] [--verbose]**
+
+DESCRIPTION
+===========
+
+This creates a new Bitbucket repo with the current directory basename and
+adds a `bitbucket` remote.
+
+The directory does not need to be a git repository, but if it isn't,
+this command calls `git init` so it can add the
+
+OPTIONS
+=======
+
+* --create - (default operation) create the repository and configure the remote
+* --delete - delete the repository and remove the remote
+* --verbose - output extra information
+* --dry-run - stop before doing anything on Bitbucket, and show what will happen
+* --remote - the name to use for the remote (default: `bitbucket`)
+* --no-init - do not init a new repo in the directory (default: 0)
+
+EXAMPLES
+========
+
+By default, this command creates a new Bitbucket repository, although you
+can specify the operation:
+
+| **$ export BITBUCKET_APP_PASSWORD=...**
+| **$ git bitbucket**
+| **$ git bitbucket --create**
+
+By default, this command will run **git init** if there's not a *.git*
+directory. You can turn that off:
+
+| **$ git bitbucket --create --no-init**
+
+Choose different values over the defaults:
+
+| **$ git bitbucket --create --remote origin --user biff --repo diff_name**
+
+If you want to see what will happen without doing it, the **--dry-run**
+tag will stop before talking to BitBucket and will show you the setup:
+
+| **$ git bitbucket --dry-run --create --remote origin --user biff --repo diff_name**
+
+To get rid of this repo:
+
+| **$ git bitbucket --delete**
+
+With a different **--user** and **--repo**, you can delete some other
+repo, I guess:
+
+| **$ git bitbucket --delete --user biff --repo some_name**
+
+ENVIRONMENT
+===========
+
+* BITBUCKET_APP_PASSWORD - your access token https://support.atlassian.com/bitbucket-cloud/docs/app-passwords/
+
+BUGS
+====
+
+See GitHub Issues: <https://github.com/briandfoy/git-services-commands/issues>
+
+LICENSE
+=======
+
+This command is available under the Artistic License 2.0.

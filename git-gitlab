@@ -1,0 +1,215 @@
+#!/usr/bin/env perl
+use v5.10;
+use strict;
+
+use constant EX_USAGE => 2;
+
+my $git = $ENV{$_};
+
+my %Operations = (
+	'create' => 'post',
+	'delete' => 'delete',
+	);
+
+my %args = (
+	'dry-run' => 0,
+	'no-init' => 0,
+	'remote'  => 'gitlab',
+	'verbose' => 0,
+	map { $_, undef } keys %Operations
+	);
+
+chomp( $args{user} = `$git config gitlab.user` );
+$args{repo} = do {
+	state $r1 = require File::Basename;
+	state $r2 = require Cwd;
+	File::Basename::basename(Cwd::getcwd());
+	};
+
+use Getopt::Long;
+GetOptions(
+	'dry-run'   => \$args{'dry-run'},
+	'no-init'   => \$args{'no-init'},
+	'remote=s'  => \$args{'remote'},
+	'repo=s'    => \$args{'repo'},
+	'user=s'    => \$args{'user'},
+	'verbose'   => \$args{'verbose'},
+	map { $_, \$args{$_} } keys %Operations
+	);
+say Dumper( \%args ); use Data::Dumper;
+
+unless( $args{user} ) {
+	warn "No user! Set gitlab.user or use --user\n";
+	exit( EX_USAGE );
+	}
+
+my @operations = map { "--$_" } grep { defined $args{$_} } sort keys %Operations;
+if( 1 < @operations ) {
+	warn "Can't do two operations at the same time: @operations\n";
+	exit( EX_USAGE );
+	}
+
+my $operation = ($operations[0] // 'create') =~ s/\A--//r;
+say "Operation is <$operation>";
+
+my $token = $ENV{GITLAB_TOKEN}
+	// do {
+		warn "Set GITLAB_TOKEN to your GitLab access token\nhttps://docs.gitlab.com/ee/user/profile/personal_access_tokens.html\n";
+		exit( EX_USAGE );
+		};
+
+if( $args{'dry-run'} ) {
+	say <<~"HERE";
+		Operation: $operation
+		User:      $args{user}
+		Repo:      $args{repo}
+		Verbose:   $args{verbose}
+		HERE
+
+	exit;
+	}
+
+require Mojo::UserAgent;
+my $ua = Mojo::UserAgent->new;
+$ua->on( start => sub {
+	my( $ua, $tx ) = @_;
+	$tx->req->headers->authorization( "Bearer $token" );
+	} );
+
+
+if( $operation eq 'create' ) {
+	# https://github.com/briandfoy/git-default-branch
+	chomp( my $default_branch = `$git default-branch` );
+	$default_branch = length $default_branch ? $default_branch : 'master';
+	say "Default branch is <$default_branch>" if $args{verbose};
+
+	my $tx = $ua->post(
+		'https://gitlab.com/api/v4/projects',
+		json => { name => $args{repo}, visibility => 'public' }
+		);
+	my $success = eval { $tx->result->is_success };
+	unless( defined $success ) {
+		warn "Error talking to GitLab";
+		say $tx->res->to_string if $args{verbose};
+		exit(4);
+		}
+
+	if( $tx->res->code != 201 ) {
+		warn "Could not create $args{user}/$args{repo}\n";
+		say "Error: ", $tx->res->json->{message}{name}[0];
+		say $tx->req->to_string if $args{verbose};
+		say $tx->result->to_string if $args{verbose};
+		exit(16);
+		}
+
+	say "Created GitLab repo <$args{user}/$args{repo}>" if $args{verbose};
+
+	my( $clone ) = $tx->result->json->{ssh_url_to_repo};
+	say "Clone URL is <$clone>" if $args{verbose};
+
+	system $git, 'remote', 'add', $args{remote}, $clone;
+	system $git, 'push', $args{remote}, $default_branch;
+	}
+elsif( $operation eq 'delete' ) {
+	my $tx = $ua->delete(
+		sprintf 'https://gitlab.com/api/v4/projects/%s%%2F%s', @args{qw(user repo)}
+		);
+	my $code = $tx->res->code;
+	if( $code == 202 ) {
+		say "deleted $args{user}/$args{repo}";
+		system $git, 'remote', 'rm', $args{remote};
+		}
+	elsif( $code == 404 ) {
+		warn "$args{user}/$args{repo} already did not exist\n";
+		}
+	else {
+		warn "Could not delete $args{user}/$args{repo}";
+		say $tx->req->to_string if $args{verbose};
+		say $tx->res->to_string if $args{verbose};
+		exit(16);
+		}
+
+	}
+
+__DATA__
+% GIT-GITLAB(1) | Git Manual
+
+NAME
+====
+
+**git-gitlab** — create or delete GitLab project based on the current directory
+
+SYNOPSIS
+========
+
+| **git config --global --add gitlab.user myusername
+| **export GITLAB_TOKEN=...
+| **git gitlab [--create | --delete] [--repo=<repo>] [--user=<user>]**
+|     **[--remote=<remote>] [--verbose] [--dry-run] [--verbose]**
+
+DESCRIPTION
+===========
+
+This creates a new GitLab repo with the current directory basename and
+adds a gitlab remote.
+
+The directory does not need to be a git repository, but if it isn't,
+this command calls `git init` so it can add the
+
+OPTIONS
+=======
+
+* --create - (default operation) create the repository and configure the remote
+* --delete - delete the repository and remove the remote
+* --verbose - output extra information
+* --dry-run - stop before doing anything on GitLab, and show what will happen
+* --remote - the name to use for the remote (default: gitlab)
+* --no-init - do not init a new repo in the directory (default: 0)
+
+EXAMPLES
+========
+
+By default, this command creates a new GitLab repository, although you
+can specify the operation:
+
+| **$ export GITLAB_TOKEN=...**
+| **$ git gitlab**
+| **$ git gitlab --create**
+
+By default, this command will run **git init** if there's not a *.git*
+directory. You can turn that off:
+
+| **$ git gitlab --create --no-init**
+
+Choose different values over the defaults:
+
+| **$ git gitlab --create --remote origin --user biff --repo diff_name**
+
+If you want to see what will happen without doing it, the **--dry-run**
+tag will stop before talking to GitLab and will show you the setup:
+
+| **$ git gitlab --dry-run --create --remote origin --user biff --repo diff_name**
+
+To get rid of this repo:
+
+| **$ git gitlab --delete**
+
+With a different **--user** and **--repo**, you can delete some other
+repo, I guess:
+
+| **$ git gitlab --delete --user biff --repo some_name**
+
+ENVIRONMENT
+===========
+
+* GITLAB_TOKEN - your access token https://docs.gitlab.com/ee/user/profile/personal_access_tokens.html
+
+BUGS
+====
+
+See GitHub Issues: <https://github.com/briandfoy/git-services-commands/issues>
+
+LICENSE
+=======
+
+This command is available under the Artistic License 2.0.
