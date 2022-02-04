@@ -161,10 +161,10 @@ OPTIONS
 
 * --create - (default operation) create the repository and configure the remote
 * --delete - delete the repository and remove the remote
-* --verbose - output extra information
 * --dry-run - stop before doing anything on GitLab, and show what will happen
-* --remote - the name to use for the remote (default: gitlab)
 * --no-init - do not init a new repo in the directory (default: 0)
+* --remote - the name to use for the remote (default: gitlab)
+* --verbose - output extra information
 
 EXAMPLES
 ========
