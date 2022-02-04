@@ -69,7 +69,15 @@ if( $args{'dry-run'} ) {
 	exit;
 	}
 
-require Mojo::UserAgent;
+unless( eval { require Mojo::UserAgent } ) {
+	warn <<~'HERE';
+		Install Mojolicious to use this command
+
+			$ cpan Mojolicious
+		HERE
+	exit(4);
+	};
+
 my $ua = Mojo::UserAgent->new;
 $ua->on( start => sub {
 	my( $ua, $tx ) = @_;
