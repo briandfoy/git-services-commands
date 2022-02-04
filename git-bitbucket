@@ -82,7 +82,8 @@ require Mojo::Util;
 my $ua = Mojo::UserAgent->new;
 $ua->on( start => sub {
 	my( $ua, $tx ) = @_;
-	$tx->req->headers->authorization( "Basic " . Mojo::Util::b64_encode( join ':', $args{user}, $token ) );
+	chomp( my $userinfo = Mojo::Util::b64_encode( join ':', $args{user}, $token ) );
+	$tx->req->headers->authorization( "Basic " . $userinfo );
 	} );
 
 if( ! -e '.git' and ! $args{'no-init'} ) {
