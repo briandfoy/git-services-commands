@@ -4,7 +4,7 @@ use strict;
 
 use constant EX_USAGE => 2;
 
-my $git = $ENV{$_};
+my $git = $ENV{_};
 
 my %Operations = (
 	'create' => 'post',
