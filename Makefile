@@ -1,3 +1,4 @@
+ENV=env
 GIT_CMD_DIR=$(shell git --exec-path)
 MAN_PREFIX=/usr/local/share
 MAN_DIR=$(MAN_PREFIX)/man
@@ -20,6 +21,10 @@ install_scripts: $(SCRIPTS)
 .PHONY: install_mans
 install_mans: $(MANS)
 	@ for manpage in $(MANS); do $(INSTALL) -v -m 444 $$manpage $(MAN1_DIR)/$$manpage; done
+
+.PHONY: cpan
+cpan:
+	@ $(ENV) cpan Mojolicious
 
 %.1: %.1.md
 	@ $(PANDOC) --standalone --to man $< -o $@
