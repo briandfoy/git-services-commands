@@ -2,7 +2,12 @@
 use v5.10;
 use strict;
 
-use constant EX_USAGE => 2;
+use constant EX_SUCCESS       =>  0;
+use constant EX_USAGE         =>  2;
+use constant EX_NETWORK       =>  4;
+use constant EX_GIT_ERROR     =>  8;
+use constant EX_UNAUTHORIZED  => 16;
+use constant EX_FAILED        => 32;
 
 my $git = $ENV{_};
 
@@ -38,15 +43,17 @@ GetOptions(
 	'verbose'   => \$args{'verbose'},
 	map { $_, \$args{$_} } keys %Operations
 	);
-say Dumper( \%args ); use Data::Dumper;
+
+use subs qw(verbose);
+*verbose = ! $args{verbose} ? sub {} : sub { warn "$_[0]\n" };
 
 unless( $args{user} ) {
-	warn "No user! Set bitbucket.user or use --user\n";
+	warn "No user! Set bitbucket.user or use --user";
 	exit( EX_USAGE );
 	}
 
 if( $args{repo} =~ m/[^a-z0-9_.-]/ ) {
-	warn "The repo name must be lowercase, alphanumerical, dash, underscore, or dot\n";
+	warn "The repo name must be lowercase, alphanumerical, dash, underscore, or dot";
 	exit( EX_USAGE );
 	}
 
@@ -57,11 +64,10 @@ if( 1 < @operations ) {
 	}
 
 my $operation = ($operations[0] // 'create') =~ s/\A--//r;
-say "Operation is <$operation>";
 
 my $token = $ENV{BITBUCKET_APP_PASSWORD}
 	// do {
-		warn "Set BITBUCKET_APP_PASSWORD to your BitBucket app password\nhttps://support.atlassian.com/bitbucket-cloud/docs/app-passwords/\n";
+		warn "Set BITBUCKET_APP_PASSWORD to your BitBucket app password\nhttps://support.atlassian.com/bitbucket-cloud/docs/app-passwords/";
 		exit( EX_USAGE );
 		};
 
@@ -73,8 +79,7 @@ if( $args{'dry-run'} ) {
 		Repo:      $args{repo}
 		Verbose:   $args{verbose}
 		HERE
-
-	exit;
+	exit( EX_SUCCESS );
 	}
 
 unless( eval { require Mojo::UserAgent } ) {
@@ -83,7 +88,7 @@ unless( eval { require Mojo::UserAgent } ) {
 
 			$ cpan Mojolicious
 		HERE
-	exit(4);
+	exit(EX_FAILED);
 	};
 
 require Mojo::Util;
@@ -96,14 +101,12 @@ $ua->on( start => sub {
 
 if( ! -e '.git' and ! $args{'no-init'} ) {
 	system $git, 'init' or die "Could not init git repo";
-	exit(8);
+	exit(EX_GIT_ERROR);
 	}
 
 if( $operation eq 'create' ) {
-	# https://github.com/briandfoy/git-default-branch
-	chomp( my $default_branch = `$git default-branch` );
-	$default_branch = length $default_branch ? $default_branch : 'master';
-	say "Default branch is <$default_branch>" if $args{verbose};
+	my $default_branch = git_default_branch();
+	verbose "Default branch is <$default_branch>";
 
 	my $url = sprintf 'https://api.bitbucket.org/2.0/repositories/%s/%s', @args{qw(user repo)};
 
@@ -112,24 +115,27 @@ if( $operation eq 'create' ) {
 		json => { project => { key => $args{project} } },
 		);
 	my $success = eval { $tx->result->is_success };
+	say $tx->result->to_string;
 	unless( defined $success ) {
 		warn "Error talking to BitBucket";
-		say $tx->res->to_string if $args{verbose};
-		exit(4);
+		verbose $tx->res->to_string;
+		exit(EX_NETWORK);
 		}
 
-	if( $tx->res->code == 400 ) {
+	if( $tx->res->code >= 400 ) {
 		warn "ERROR: " . (eval { $tx->res->json->{error}{message} } // $tx->res->body) . "\n";
-		say $tx->res->to_string if $args{verbose};
-		exit(16);
+		verbose $tx->req->to_string;
+		verbose $tx->res->to_string;
+		exit(EX_UNAUTHORIZED);
 		}
-	say "Created Bitbucket repo <$args{user}/$args{repo}>" if $args{verbose};
+
+	verbose "Created Bitbucket repo <$args{user}/$args{repo}>";
 
 	my( $clone ) =
 		map { $_->{href} }
 		grep { $_->{name} eq 'ssh' }
 		$tx->result->json->{links}{clone}->@*;
-	say "Clone URL is <$clone>" if $args{verbose};
+	verbose "Clone URL is <$clone>";
 
 	system $git, 'remote', 'add', $args{remote}, $clone;
 	system $git, 'push', $args{remote}, $default_branch;
@@ -142,19 +148,36 @@ elsif( $operation eq 'delete' ) {
 	if( $code == 204 ) {
 		say "deleted $args{user}/$args{repo}";
 		system $git, 'remote', 'rm', $args{remote};
+		exit(EX_SUCCESS)
 		}
 	elsif( $code == 404 ) {
 		warn "$args{user}/$args{repo} already did not exist\n";
+		exit(EX_SUCCESS)
 		}
 	elsif( $code == 403 ) {
-		warn $tx->res->json->{error}{message};
+		warn eval { $tx->res->json->{error}{message} } // 'Unauthorized';
+		exit(EX_UNAUTHORIZED);
 		}
 	else {
 		warn "Could not delete $args{user}/$args{repo}";
-		say $tx->req->to_string if $args{verbose};
-		say $tx->res->to_string if $args{verbose};
-		exit(16);
+		verbose $tx->req->to_string;
+		verbose $tx->res->to_string;
+		exit(EX_FAILED);
 		}
+	}
+
+sub git_default_branch {
+	my $default_branch = 'master';
+	my @version = map { 0+$_ } split /\./, `$ENV{_} --version` =~ s/\A\D+//r;
+
+	# Git 2.28 allowed you to change the default branch
+	return $default_branch if(
+			   $version[0] <  2
+			|| $version[0] == 2 and $version[1] < 28
+			);
+
+	chomp( my $branch = `$ENV{_} config --get init.defaultBranch` );
+	return length $branch ? $branch : $default_branch;
 	}
 
 __DATA__

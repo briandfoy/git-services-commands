@@ -2,7 +2,12 @@
 use v5.10;
 use strict;
 
-use constant EX_USAGE => 2;
+use constant EX_SUCCESS       =>  0;
+use constant EX_USAGE         =>  2;
+use constant EX_NETWORK       =>  4;
+use constant EX_GIT_ERROR     =>  8;
+use constant EX_UNAUTHORIZED  => 16;
+use constant EX_FAILED        => 32;
 
 my $git = $ENV{_};
 
@@ -14,12 +19,12 @@ my %Operations = (
 my %args = (
 	'dry-run' => 0,
 	'no-init' => 0,
-	'remote'  => 'gitlab',
+	'remote'  => 'github',
 	'verbose' => 0,
 	map { $_, undef } keys %Operations
 	);
 
-chomp( $args{user} = `$git config gitlab.user` );
+chomp( $args{user} = `$git config github.user` );
 $args{repo} = do {
 	state $r1 = require File::Basename;
 	state $r2 = require Cwd;
@@ -36,7 +41,9 @@ GetOptions(
 	'verbose'   => \$args{'verbose'},
 	map { $_, \$args{$_} } keys %Operations
 	);
-say Dumper( \%args ); use Data::Dumper;
+
+use subs qw(verbose);
+*verbose = ! $args{verbose} ? sub {} : sub { warn "$_[0]\n" };
 
 unless( $args{user} ) {
 	warn "No user! Set gitlab.user or use --user\n";
@@ -49,8 +56,13 @@ if( 1 < @operations ) {
 	exit( EX_USAGE );
 	}
 
+my @operations = map { "--$_" } grep { defined $args{$_} } sort keys %Operations;
+if( 1 < @operations ) {
+	warn "Can't do two operations at the same time: @operations\n";
+	exit( EX_USAGE );
+	}
+
 my $operation = ($operations[0] // 'create') =~ s/\A--//r;
-say "Operation is <$operation>";
 
 my $token = $ENV{GITHUB_TOKEN}
 	// do {
@@ -65,8 +77,7 @@ if( $args{'dry-run'} ) {
 		Repo:      $args{repo}
 		Verbose:   $args{verbose}
 		HERE
-
-	exit;
+	exit( EX_SUCCESS );
 	}
 
 unless( eval { require Mojo::UserAgent } ) {
@@ -75,7 +86,7 @@ unless( eval { require Mojo::UserAgent } ) {
 
 			$ cpan Mojolicious
 		HERE
-	exit(4);
+	exit(EX_FAILED);
 	};
 
 my $ua = Mojo::UserAgent->new;
@@ -85,11 +96,14 @@ $ua->on( start => sub {
 	$tx->req->headers->accept( 'application/vnd.github.v3+json' );
 	} );
 
+if( ! -e '.git' and ! $args{'no-init'} ) {
+	system $git, 'init' or die "Could not init git repo";
+	exit(EX_GIT_ERROR);
+	}
+
 if( $operation eq 'create' ) {
-	# https://github.com/briandfoy/git-default-branch
-	chomp( my $default_branch = `$git default-branch` );
-	$default_branch = length $default_branch ? $default_branch : 'master';
-	say "Default branch is <$default_branch>" if $args{verbose};
+	my $default_branch = git_default_branch();
+	verbose "Default branch is <$default_branch>";
 
 	my $tx = $ua->post(
 		'https://api.github.com/repos',
@@ -98,22 +112,22 @@ if( $operation eq 'create' ) {
 	my $success = eval { $tx->result->is_success };
 	unless( defined $success ) {
 		warn "Error talking to GitHub";
-		say $tx->res->to_string if $args{verbose};
-		exit(4);
+		verbose $tx->res->to_string;
+		exit(EX_NETWORK);
 		}
 
 	if( $tx->res->code != 201 ) {
 		warn "Could not create $args{user}/$args{repo}\n";
 		say "Error: ", $tx->res->json->{message}{name}[0];
-		say $tx->req->to_string if $args{verbose};
-		say $tx->result->to_string if $args{verbose};
+		verbose $tx->req->to_string;
+		verbose $tx->result->to_string;
 		exit(16);
 		}
 
-	say "Created GitLab repo <$args{user}/$args{repo}>" if $args{verbose};
+	verbose "Created GitLab repo <$args{user}/$args{repo}>";
 
 	my( $clone ) = $tx->result->json->{ssh_url_to_repo};
-	say "Clone URL is <$clone>" if $args{verbose};
+	verbose "Clone URL is <$clone>";
 
 	system $git, 'remote', 'add', $args{remote}, $clone;
 	system $git, 'push', $args{remote}, $default_branch;
@@ -126,17 +140,33 @@ elsif( $operation eq 'delete' ) {
 	if( $code == 204 ) {
 		say "deleted $args{user}/$args{repo}";
 		system $git, 'remote', 'rm', $args{remote};
+		exit(EX_SUCCESS)
 		}
 	elsif( $code == 404 ) {
 		warn "$args{user}/$args{repo} already did not exist\n";
+		exit(EX_SUCCESS)
 		}
 	else {
 		warn "Could not delete $args{user}/$args{repo}";
-		say $tx->req->to_string if $args{verbose};
-		say $tx->res->to_string if $args{verbose};
-		exit(16);
+		verbose $tx->req->to_string;
+		verbose $tx->res->to_string;
+		exit(EX_FAILED);
 		}
 
+	}
+
+sub git_default_branch {
+	my $default_branch = 'master';
+	my @version = map { 0+$_ } split /\./, `$ENV{_} --version` =~ s/\A\D+//r;
+
+	# Git 2.28 allowed you to change the default branch
+	return $default_branch if(
+			   $version[0] <  2
+			|| $version[0] == 2 and $version[1] < 28
+			);
+
+	chomp( my $branch = `$ENV{_} config --get init.defaultBranch` );
+	return length $branch ? $branch : $default_branch;
 	}
 
 __DATA__
@@ -153,7 +183,7 @@ SYNOPSIS
 | **git config --global --add github.user myusername
 | **export GITHUB_TOKEN=...
 | **git github [--create | --delete] [--repo=<repo>] [--user=<user>]**
-|     **[--remote=<remote>] [--verbose] [--dry-run] [--verbose]**
+|     **[--remote=<remote>] [--dry-run] [--help] [--no-init] [--verbose]**
 
 DESCRIPTION
 ===========
@@ -169,10 +199,11 @@ OPTIONS
 
 * --create - (default operation) create the repository and configure the remote
 * --delete - delete the repository and remove the remote
-* --verbose - output extra information
 * --dry-run - stop before doing anything on GitHub, and show what will happen
-* --remote - the name to use for the remote (default: `github`)
+* --help - show the documentation
 * --no-init - do not init a new repo in the directory (default: 0)
+* --remote - the name to use for the remote (default: `github`)
+* --verbose - output extra information
 
 EXAMPLES
 ========
